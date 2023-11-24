@@ -1,6 +1,6 @@
 use actix_session::{storage::CookieSessionStore, SessionExt, SessionMiddleware};
 use actix_web::{
-    cookie::Key,
+    cookie::{Key, Cookie},
     get, post,
     web::{self, Json, Query, Redirect},
     App, HttpRequest, HttpResponse, HttpServer, Responder,
@@ -21,25 +21,38 @@ struct Pkce {
     challenge: String,
 }
 
+// ext::auth::PKCEChallenge
+
+use sha2::Digest;
+
 impl Pkce {
     fn generate() -> Self {
         let mut verifier = String::new();
         let random: [u8; 32] = std::array::from_fn(|_| rand::random::<u8>());
-        let verifier = base64_url::encode_to_string(&random, &mut verifier).to_string();
+        let verifier = base64_url::escape(base64_url::encode_to_string(
+            &random,
+            &mut verifier
+        ))
+        .to_string();
 
-        let challenge = sha256::digest(verifier.clone());
-        let challenge = base64_url::encode(&challenge);
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(verifier.clone());
+        let result = hasher.finalize();
+        let challenge = base64_url::encode(&result);
 
         assert!(verifier.len() == 43);
-        println!("Verifier: {verifier}\nChallenge: {challenge}");
+        assert!(challenge.len() == 43);
+
+        println!("Verifier:\n {verifier}\nChallenge:\n {challenge}");
         Self {
             verifier,
-            challenge,
+            challenge: challenge.to_string(),
         }
     }
 }
 
-fn build_url(url: String, params: &[(&str, &str)]) -> String {
+fn build_url(suffix: &str, params: &[(&str, &str)]) -> String {
+    let url = format!("{EDGEDB_AUTH_BASE_URL}/{suffix}");
     let mut url = url::Url::parse(&url).unwrap();
     for (name, value) in params {
         url.query_pairs_mut().append_pair(name, value);
@@ -52,14 +65,11 @@ fn build_url(url: String, params: &[(&str, &str)]) -> String {
 //
 
 /// #[get("/auth/ui/signin")]
-#[get("/auth/ui/signin")]
+#[get("/auth/ui/signin_")]
 async fn handle_ui_signin(request: HttpRequest) -> impl Responder {
     let pkce = Pkce::generate();
 
-    let redirect_url = build_url(
-        format!("{EDGEDB_AUTH_BASE_URL}/ui/signin"),
-        &[("challenge", &pkce.challenge)],
-    );
+    let redirect_url = build_url("ui/signin", &[("challenge", &pkce.challenge)]);
 
     request
         .get_session()
@@ -69,14 +79,11 @@ async fn handle_ui_signin(request: HttpRequest) -> impl Responder {
 }
 
 /// #[get("/auth/ui/signup")]
-#[get("/auth/ui/signup")]
+#[get("/auth/ui/signup_")]
 async fn handle_ui_signup(request: HttpRequest) -> impl Responder {
     let pkce = Pkce::generate();
 
-    let redirect_url = build_url(
-        format!("{EDGEDB_AUTH_BASE_URL}/ui/signup"),
-        &[("challenge", &pkce.challenge)],
-    );
+    let redirect_url = build_url("ui/signup", &[("challenge", &pkce.challenge)]);
 
     request
         .get_session()
@@ -101,7 +108,7 @@ async fn handle_authorize(query: Query<HandleAuthorize>, request: HttpRequest) -
     let pkce = Pkce::generate();
 
     let redirect_url = build_url(
-        format!("{EDGEDB_AUTH_BASE_URL}/authorize"),
+        "authorize",
         &[
             ("provider", &provider),
             ("challenge", &pkce.challenge),
@@ -149,7 +156,7 @@ async fn handle_signup(query: Query<HandleSignup>, request: HttpRequest) -> impl
         password,
         provider,
     } = query.into_inner();
-    let register_url = build_url(format!("{EDGEDB_AUTH_BASE_URL}/register"), &[]);
+    let register_url = build_url("register", &[]);
 
     // Just used to see if the post succeeds, don't care about the return text?
     let _register_response = reqwest::Client::new()
@@ -224,7 +231,7 @@ async fn handle_signin(query: Json<HandleSignin>, request: HttpRequest) -> impl 
         .unwrap();
 
     let token_url = build_url(
-        format!("{EDGEDB_AUTH_BASE_URL}/token"),
+        "token",
         &[
             ("code", &authenticate_response.code),
             ("verifier", &pkce.verifier),
@@ -283,10 +290,7 @@ async fn handle_verify(query: Query<HandleVerify>, request: HttpRequest) -> impl
         .await
         .unwrap();
 
-    let token_url = build_url(
-        format!("{EDGEDB_AUTH_BASE_URL}/token"),
-        &[("code", &code), ("verifier", &verifier)],
-    );
+    let token_url = build_url("token", &[("code", &code), ("verifier", &verifier)]);
 
     let auth_token = reqwest::get(token_url).await.unwrap().text().await.unwrap();
 
@@ -319,13 +323,10 @@ async fn handle_send_password_reset_email(
     reset: Query<HandleSendPasswordResetEmail>,
 ) -> impl Responder {
     let HandleSendPasswordResetEmail { email } = reset.into_inner();
-    let reset_url = build_url(
-        format!("http://localhost:${SERVER_PORT}/auth/ui/reset-password"),
-        &[],
-    );
+    let reset_url = format!("http://localhost:${SERVER_PORT}/auth/ui/reset-password");
     let provider = "builtin::local_emailpassword".to_string();
     let pkce = Pkce::generate();
-    let send_reset_url = build_url(format!("{EDGEDB_AUTH_BASE_URL}/send-reset-url"), &[]);
+    let send_reset_url = build_url("send-reset-url", &[]);
 
     let SendResetResponse { email_sent } = reqwest::Client::new()
         .post(send_reset_url)
@@ -391,7 +392,7 @@ struct TokenResponse {
 
 #[derive(Debug, Deserialize)]
 struct ResetResponse {
-    code: String
+    code: String,
 }
 
 /// #[post("/auth/reset-password")]
@@ -407,7 +408,11 @@ async fn handle_reset_password(
     } = query.into_inner();
 
     let reset_url = format!("{EDGEDB_AUTH_BASE_URL}/reset-password");
-    let verifier: String = request.get_session().get("edgedb-pkce-verifier").unwrap().unwrap();
+    let verifier: String = request
+        .get_session()
+        .get("edgedb-pkce-verifier")
+        .unwrap()
+        .unwrap();
     let reset_response: ResetResponse = reqwest::Client::new()
         .post(reset_url)
         .json(&ResetRequest {
@@ -423,7 +428,7 @@ async fn handle_reset_password(
         .unwrap();
 
     let token_url = build_url(
-        format!("{EDGEDB_AUTH_BASE_URL}/token"),
+        "/token",
         &[("code", &reset_response.code), ("verifier", &verifier)],
     );
 
@@ -445,40 +450,38 @@ struct HandleCallback {
     code: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct ExchangeResponse {
+    auth_token: String,
+    identity_id: String,
+    provider_token: String,
+    provider_refresh_token: String
+}
+
 // HANDLE CALLBACK: same for all
 /// #[get("/auth/callback")]
 #[get("/auth/callback")]
 async fn handle_callback(response: Query<HandleCallback>, request: HttpRequest) -> impl Responder {
     let session = request.get_session();
-    println!("Session cookies: {:#?}", session.entries());
-    println!("Got a {response:?}");
+    println!("\nCallback: session cookies are {:#?}", session.entries());
 
     let HandleCallback { code } = response.into_inner();
     let verifier: String = session.get("edgedb-pkce-verifier").unwrap().unwrap();
-    println!("Here's the verifier! {verifier}");
 
-    let code_exchange_url = build_url(
-        format!("{EDGEDB_AUTH_BASE_URL}/token"),
-        &[("code", &code), ("verifier", &verifier)],
-    );
-    println!("The code exchange url is: {}", code_exchange_url);
+    let code_exchange_url = build_url("token", &[("code", &code), ("verifier", &verifier)]);
 
-    let code_exchange_response = reqwest::get(&code_exchange_url.to_string())
+    let exchange_response: ExchangeResponse = reqwest::get(&code_exchange_url.to_string())
         .await
         .unwrap()
-        .text()
+        .json()
         .await
         .unwrap();
 
-    println!("Exchange response: {code_exchange_response:?}");
-    let auth_token = code_exchange_response;
+    println!("Exchange response: {exchange_response:#?}");
 
-    request
-        .get_session()
-        .insert("edgedb-auth-token", auth_token)
-        .unwrap();
+    let cookie = Cookie::build("edgedb-auth-token", exchange_response.auth_token).finish();
 
-    HttpResponse::Ok()
+    HttpResponse::Ok().cookie(cookie).finish()
 }
 
 #[actix_web::main]
@@ -495,7 +498,6 @@ async fn main() -> std::io::Result<()> {
             // UI FLOW
             .service(handle_ui_signin)
             .service(handle_ui_signup)
-            .service(handle_callback)
             // OAUTH FLOW
             .service(handle_authorize)
             // EMAIL FLOW
@@ -505,6 +507,8 @@ async fn main() -> std::io::Result<()> {
             .service(handle_send_password_reset_email)
             .service(handle_ui_reset_password)
             .service(handle_reset_password)
+            // CALLBACK HANDLER
+            .service(handle_callback)
     })
     .bind(&format!("127.0.0.1:{SERVER_PORT}"))
     .unwrap()
