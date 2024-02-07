@@ -65,7 +65,7 @@ fn build_url(suffix: &str, params: &[(&str, &str)]) -> String {
 //
 
 /// #[get("/auth/ui/signin")]
-#[get("/auth/ui/signin_")]
+#[get("/auth/ui/signin")]
 async fn handle_ui_signin(request: HttpRequest) -> impl Responder {
     let pkce = Pkce::generate();
 
@@ -79,7 +79,7 @@ async fn handle_ui_signin(request: HttpRequest) -> impl Responder {
 }
 
 /// #[get("/auth/ui/signup")]
-#[get("/auth/ui/signup_")]
+#[get("/auth/ui/signup")]
 async fn handle_ui_signup(request: HttpRequest) -> impl Responder {
     let pkce = Pkce::generate();
 
@@ -128,10 +128,11 @@ async fn handle_authorize(query: Query<HandleAuthorize>, request: HttpRequest) -
 
 //
 // EMAIL AND PASSWORD FLOW: https://www.edgedb.com/docs/guides/auth/email_password
+// See https://www.edgedb.com/docs/guides/auth/index#enabling-authentication-providers for config
 //
 
 #[derive(Debug, Deserialize)]
-struct HandleSignup {
+struct EmailFlowQuery {
     email: String,
     password: String,
     provider: String,
@@ -149,9 +150,10 @@ struct Signup {
 /// Handles sign up with email and password.
 /// #[get("/auth/signup")]
 #[get("/auth/signup")]
-async fn handle_signup(query: Query<HandleSignup>, request: HttpRequest) -> impl Responder {
+async fn handle_signup(query: Query<EmailFlowQuery>, request: HttpRequest) -> impl Responder {
     let pkce = Pkce::generate();
-    let HandleSignup {
+    println!("Got a signup: {query:#?}");
+    let EmailFlowQuery {
         email,
         password,
         provider,
@@ -159,21 +161,26 @@ async fn handle_signup(query: Query<HandleSignup>, request: HttpRequest) -> impl
     let register_url = build_url("register", &[]);
 
     // Just used to see if the post succeeds, don't care about the return text?
-    let _register_response = reqwest::Client::new()
+
+    let signup = dbg!(Signup {
+        challenge: pkce.challenge,
+        email,
+        password,
+        provider,
+        verify_url: format!("http://localhost:{SERVER_PORT}/auth/verify"),
+    });
+
+    let register_response = reqwest::Client::new()
         .post(register_url)
-        .json(&Signup {
-            challenge: pkce.challenge,
-            email,
-            password,
-            provider,
-            verify_url: format!("http://localhost:${SERVER_PORT}/auth/verify"),
-        })
+        .json(&signup)
         .send()
         .await
         .unwrap()
         .text()
         .await
         .unwrap();
+
+    println!("Register response is: {register_response}");
 
     request
         .get_session()
@@ -184,14 +191,7 @@ async fn handle_signup(query: Query<HandleSignup>, request: HttpRequest) -> impl
     HttpResponse::NoContent()
 }
 
-#[derive(Deserialize)]
-struct HandleSignin {
-    email: String,
-    password: String,
-    provider: String,
-}
-
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct AuthenticateRequest {
     challenge: String,
     email: String,
@@ -206,34 +206,42 @@ struct AuthenticateResponse {
 
 /// #[get("/auth/signin")]
 #[get("/auth/signin")]
-async fn handle_signin(query: Json<HandleSignin>, request: HttpRequest) -> impl Responder {
-    let HandleSignin {
+async fn handle_signin(query: Query<EmailFlowQuery>, request: HttpRequest) -> impl Responder {
+    println!("Got a signin: {query:?}");
+    let EmailFlowQuery {
         email,
         password,
         provider,
     } = query.into_inner();
+    
     let authenticate_url = format!("{EDGEDB_AUTH_BASE_URL}/authenticate");
     let pkce = Pkce::generate();
 
-    let authenticate_response: AuthenticateResponse = reqwest::Client::new()
+    let authenticate_request = AuthenticateRequest {
+        challenge: pkce.challenge,
+        email,
+        password,
+        provider,
+    };
+
+    println!("Going to authenticate at {authenticate_url} with {authenticate_request:#?}");
+
+    let authenticate_response: String = reqwest::Client::new()
         .post(authenticate_url)
-        .json(&AuthenticateRequest {
-            challenge: pkce.challenge,
-            email,
-            password,
-            provider,
-        })
+        .json(&authenticate_request)
         .send()
         .await
         .unwrap()
-        .json()
+        .text()
         .await
         .unwrap();
+
+    println!("Authenticate response: {authenticate_response}");
 
     let token_url = build_url(
         "token",
         &[
-            ("code", &authenticate_response.code),
+            ("code", &authenticate_response),
             ("verifier", &pkce.verifier),
         ],
     );
@@ -244,6 +252,8 @@ async fn handle_signin(query: Json<HandleSignin>, request: HttpRequest) -> impl 
         .text()
         .await
         .unwrap();
+
+    println!("Auth token: {auth_token}");
 
     request
         .get_session()
@@ -292,7 +302,7 @@ async fn handle_verify(query: Query<HandleVerify>, request: HttpRequest) -> impl
 
     let token_url = build_url("token", &[("code", &code), ("verifier", &verifier)]);
 
-    let auth_token = reqwest::get(token_url).await.unwrap().text().await.unwrap();
+    let auth_token = dbg!(reqwest::get(token_url).await.unwrap().text().await.unwrap());
 
     session.insert("edgedb-auth-token", auth_token).unwrap();
     // NoContent = 204
@@ -469,6 +479,7 @@ async fn handle_callback(response: Query<HandleCallback>, request: HttpRequest) 
     let verifier: String = session.get("edgedb-pkce-verifier").unwrap().unwrap();
 
     let code_exchange_url = build_url("token", &[("code", &code), ("verifier", &verifier)]);
+    println!("Code exchange url is: {code_exchange_url}");
 
     let exchange_response: ExchangeResponse = reqwest::get(&code_exchange_url.to_string())
         .await
@@ -481,11 +492,16 @@ async fn handle_callback(response: Query<HandleCallback>, request: HttpRequest) 
 
     let cookie = Cookie::build("edgedb-auth-token", exchange_response.auth_token).finish();
 
-    HttpResponse::Ok().cookie(cookie).finish()
+    HttpResponse::Ok()
+        .cookie(cookie)
+        .body("<html><body>You did it, you signed up!</body></html>")
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+
+    
+
     let key = Key::generate();
 
     HttpServer::new(move || {
